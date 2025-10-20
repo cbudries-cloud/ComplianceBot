@@ -17,8 +17,6 @@ if (!fs.existsSync(CSV)) {
   fs.writeFileSync(CSV, "timestamp,ticket_id,url,final_url,http_status,decision,confidence,violations_json,company_domain\n");
 }
 
-const cache = new Cache("data.db");
-
 async function postSlack(text: string): Promise<void> {
   const url = process.env.SLACK_WEBHOOK_URL;
   if (!url) return;
