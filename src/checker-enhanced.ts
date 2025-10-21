@@ -1,7 +1,6 @@
 import OpenAI from "openai";
 import { COMPLIANCE_GUIDE } from "./compliance_guide.js";
 import { POLICIES, Policy } from "./policies.js";
-import { learningSystem } from "./learning.js";
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -75,7 +74,7 @@ async function quickPatternCheck(text: string): Promise<Partial<Violation>[]> {
         text.toLowerCase().includes(phrase.toLowerCase())
       );
       
-      if (!hasRequiredPhrase && (text.toLowerCase().includes('hsa') || text.toLowerCase().includes('fsa'))) {
+      if (!hasRequiredPhrase && text.toLowerCase().includes('hsa') || text.toLowerCase().includes('fsa')) {
         violations.push({
           policy_id: policy.id,
           severity: policy.severity,

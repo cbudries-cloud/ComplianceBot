@@ -1,8 +1,10 @@
 import "dotenv/config";
 import express, { Request, Response } from "express";
 import { fetchPage } from "./crawler.js";
-import { reviewText } from "./checker.js";
+import { reviewTextEnhanced, ComplianceResult } from "./checker.js";
 import { Cache } from "./cache.js";
+import { learningSystem } from "./learning.js";
+import { createEnhancedSlackMessage } from "./slack-enhanced.js";
 import fs from "fs";
 
 const app = express();
@@ -30,6 +32,25 @@ async function postSlack(text: string): Promise<void> {
     });
   } catch (error) {
     console.error("Slack notification failed:", error);
+  }
+}
+
+async function postSlackEnhanced(message: any): Promise<void> {
+  const url = process.env.SLACK_WEBHOOK_URL;
+  if (!url) return;
+  
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(message),
+    });
+    
+    if (!response.ok) {
+      console.error(`Enhanced Slack webhook failed: ${response.status}`);
+    }
+  } catch (error) {
+    console.error("Failed to post enhanced message to Slack:", error);
   }
 }
 
@@ -150,7 +171,24 @@ async function processTicket(ticketId: string): Promise<void> {
     
     try {
       pageData = await fetchPage(url);
-      review = await reviewText(pageData.rendered_text);
+      console.log(`📄 Fetched page: ${pageData.final_url} (${pageData.http_status})`);
+      
+      // Enhanced compliance review
+      const result: ComplianceResult = await reviewTextEnhanced(pageData.rendered_text);
+      console.log(`🤖 Enhanced Review: ${result.overall_decision} (${(result.confidence * 100).toFixed(0)}% confidence)`);
+      console.log(`📊 Summary: ${result.summary}`);
+      
+      // Log to CSV with enhanced data
+      const ts = new Date().toISOString();
+      const violationsJson = JSON.stringify(result.violations).replaceAll('"', '""');
+      fs.appendFileSync(CSV,
+        `${ts},${ticketId},"${url}","${pageData.final_url}",${pageData.http_status},${result.overall_decision},${result.confidence},"${violationsJson}","${companyDomain || ''}"\n`
+      );
+      
+      // Create and send enhanced Slack message
+      const slackMessage = await createEnhancedSlackMessage(result, url, pageData.http_status);
+      await postSlackEnhanced(slackMessage);
+      
     } catch (error: any) {
       // Handle fetch/review errors
       const ts = new Date().toISOString();
@@ -164,33 +202,10 @@ async function processTicket(ticketId: string): Promise<void> {
       return;
     }
 
-    const ts = new Date().toISOString();
-
-    // Log to CSV
-    const violationsJson = JSON.stringify(review.violations).replaceAll('"', '""');
-    fs.appendFileSync(CSV,
-      `${ts},${ticketId},"${url}","${pageData.final_url}",${pageData.http_status},${review.overall_decision},${review.confidence},"${violationsJson}","${companyDomain || ''}"\n`
-    );
-
-    // Send to Slack
-    let msg = `I have just read through ${review.merchant_name}'s website, and here are my findings:`;
-    
-    if (review.overall_decision === "clean") {
-      msg += "\n\nGood to go!";
-    } else {
-      msg += "\n\nIssues found:\n";
-      msg += `${summarizeViolations(review.violations)}\n`;
-      msg += `\nWebsite: ${pageData.final_url}`;
-    }
-    
-    await postSlack(msg);
-
     // Mark as processed
     cache.mark(ticketId, url);
     
     console.log(`✅ Completed processing ticket ${ticketId}`);
-    console.log(`   Decision: ${review.overall_decision}`);
-    console.log(`   Violations: ${review.violations.length}`);
     
   } catch (error: any) {
     console.error(`💥 Error processing ticket ${ticketId}:`, error.message);

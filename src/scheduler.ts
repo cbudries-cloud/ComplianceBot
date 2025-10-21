@@ -1,8 +1,10 @@
 import "dotenv/config";
 import express from "express";
 import { fetchPage } from "./crawler.js";
-import { reviewText } from "./checker.js";
+import { reviewTextEnhanced, ComplianceResult } from "./checker.js";
 import { Cache } from "./cache.js";
+import { learningSystem } from "./learning.js";
+import { createEnhancedSlackMessage } from "./slack-enhanced.js";
 import fs from "fs";
 
 const app = express();
@@ -29,6 +31,25 @@ async function postSlack(text: string): Promise<void> {
     });
   } catch (error) {
     console.error("Slack notification failed:", error);
+  }
+}
+
+async function postSlackEnhanced(message: any): Promise<void> {
+  const url = process.env.SLACK_WEBHOOK_URL;
+  if (!url) return;
+  
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(message),
+    });
+    
+    if (!response.ok) {
+      console.error(`Enhanced Slack webhook failed: ${response.status}`);
+    }
+  } catch (error) {
+    console.error("Failed to post enhanced message to Slack:", error);
   }
 }
 
@@ -190,7 +211,24 @@ async function processTicket(ticketId: string): Promise<void> {
     
     try {
       pageData = await fetchPage(url);
-      review = await reviewText(pageData.rendered_text);
+      console.log(`📄 Fetched page: ${pageData.final_url} (${pageData.http_status})`);
+      
+      // Enhanced compliance review
+      const result: ComplianceResult = await reviewTextEnhanced(pageData.rendered_text);
+      console.log(`🤖 Enhanced Review: ${result.overall_decision} (${(result.confidence * 100).toFixed(0)}% confidence)`);
+      console.log(`📊 Summary: ${result.summary}`);
+      
+      // Log to CSV with enhanced data
+      const ts = new Date().toISOString();
+      const violationsJson = JSON.stringify(result.violations).replaceAll('"', '""');
+      fs.appendFileSync(CSV,
+        `${ts},${ticketId},"${url}","${pageData.final_url}",${pageData.http_status},${result.overall_decision},${result.confidence},"${violationsJson}","${companyDomain || ''}"\n`
+      );
+      
+      // Create and send enhanced Slack message
+      const slackMessage = await createEnhancedSlackMessage(result, url, pageData.http_status);
+      await postSlackEnhanced(slackMessage);
+      
     } catch (error: any) {
       const ts = new Date().toISOString();
       const errorRow = `${ts},${ticketId},"${url}","${url}",0,error,0.0,"[]","${companyDomain || ''}"\n`;
@@ -203,30 +241,9 @@ async function processTicket(ticketId: string): Promise<void> {
       return;
     }
 
-    const ts = new Date().toISOString();
-
-    const violationsJson = JSON.stringify(review.violations).replaceAll('"', '""');
-    fs.appendFileSync(CSV,
-      `${ts},${ticketId},"${url}","${pageData.final_url}",${pageData.http_status},${review.overall_decision},${review.confidence},"${violationsJson}","${companyDomain || ''}"\n`
-    );
-
-    let msg = `I have just read through ${review.merchant_name}'s website, and here are my findings:`;
-    
-    if (review.overall_decision === "clean") {
-      msg += "\n\nGood to go!";
-    } else {
-      msg += "\n\nIssues found:\n";
-      msg += `${summarizeViolations(review.violations)}\n`;
-      msg += `\nWebsite: ${pageData.final_url}`;
-    }
-    
-    await postSlack(msg);
-
     cache.mark(ticketId, url);
     
     console.log(`✅ Completed processing ticket ${ticketId}`);
-    console.log(`   Decision: ${review.overall_decision}`);
-    console.log(`   Violations: ${review.violations.length}`);
     
   } catch (error: any) {
     console.error(`💥 Error processing ticket ${ticketId}:`, error.message);
@@ -237,6 +254,117 @@ async function processTicket(ticketId: string): Promise<void> {
 app.get("/healthz", (req, res) => {
   res.send("ok");
 });
+
+// Slack interactive feedback endpoint
+app.post("/slack/feedback", express.urlencoded({ extended: true }), (req, res) => {
+  try {
+    const payload = JSON.parse(req.body.payload);
+    const action = payload.actions[0];
+    const exampleId = action.value;
+    
+    // Determine feedback type
+    let feedback: 'correct' | 'incorrect' | 'needs_review';
+    if (action.action_id.startsWith('feedback_correct')) {
+      feedback = 'correct';
+    } else if (action.action_id.startsWith('feedback_incorrect')) {
+      feedback = 'incorrect';
+    } else {
+      feedback = 'needs_review';
+    }
+    
+    // Update learning system
+    learningSystem.updateExampleFeedback(exampleId, feedback);
+    
+    // Send acknowledgment back to Slack
+    res.json({
+      text: `✅ Feedback received: Thank you for your feedback! This will help improve our compliance detection.`,
+      replace_original: false
+    });
+    
+    console.log(`📝 Received feedback for example ${exampleId}: ${feedback}`);
+    
+  } catch (error: any) {
+    console.error("Error processing Slack feedback:", error);
+    res.status(500).json({ text: "Error processing feedback" });
+  }
+});
+
+// Learning insights endpoint
+app.get("/learning/insights", (req, res) => {
+  try {
+    const insights = learningSystem.generateInsights();
+    const performance = learningSystem.getPolicyPerformance();
+    const pendingExamples = learningSystem.getPendingExamples();
+    
+    res.json({
+      insights,
+      performance,
+      pending_count: pendingExamples.length,
+      total_policies: performance.length
+    });
+  } catch (error: any) {
+    console.error("Error getting learning insights:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Schedule weekly learning reports
+function scheduleWeeklyReports(): void {
+  const now = new Date();
+  const nextSunday = new Date(now);
+  
+  // Calculate next Sunday at 9 AM
+  const daysUntilSunday = (7 - now.getDay()) % 7;
+  nextSunday.setDate(now.getDate() + (daysUntilSunday === 0 ? 7 : daysUntilSunday));
+  nextSunday.setHours(9, 0, 0, 0);
+  
+  const msUntilNextSunday = nextSunday.getTime() - now.getTime();
+  
+  console.log(`📊 Weekly learning reports scheduled for: ${nextSunday.toISOString()}`);
+  
+  setTimeout(async () => {
+    await sendWeeklyReport();
+    // Schedule next report (every 7 days)
+    setInterval(sendWeeklyReport, 7 * 24 * 60 * 60 * 1000);
+  }, msUntilNextSunday);
+}
+
+async function sendWeeklyReport(): Promise<void> {
+  try {
+    console.log(`📊 Generating weekly learning report...`);
+    
+    const insights = learningSystem.generateInsights();
+    const performance = learningSystem.getPolicyPerformance();
+    const pendingExamples = learningSystem.getPendingExamples();
+    
+    let reportText = `📊 *Weekly Compliance Learning Report*\n\n`;
+    reportText += `*Performance Summary:*\n`;
+    reportText += `• Total Policies Tracked: ${performance.length}\n`;
+    reportText += `• Examples Pending Review: ${pendingExamples.length}\n`;
+    reportText += `• Average F1 Score: ${(performance.reduce((sum, p) => sum + p.f1_score, 0) / performance.length).toFixed(2)}\n\n`;
+    
+    if (insights.length > 0) {
+      reportText += `*Key Insights:*\n${insights.map(i => `• ${i}`).join('\n')}\n\n`;
+    }
+    
+    // Top performing policies
+    const topPolicies = performance
+      .sort((a, b) => b.f1_score - a.f1_score)
+      .slice(0, 3);
+      
+    if (topPolicies.length > 0) {
+      reportText += `*Top Performing Policies:*\n${topPolicies.map(p => 
+        `• ${p.policy_id}: F1=${p.f1_score.toFixed(2)} (P=${p.precision.toFixed(2)}, R=${p.recall.toFixed(2)})`
+      ).join('\n')}`;
+    }
+    
+    await postSlack(reportText);
+    console.log(`✅ Weekly learning report sent`);
+    
+  } catch (error: any) {
+    console.error(`❌ Error sending weekly report:`, error.message);
+  }
+}
 
 async function runScheduler(): Promise<void> {
   console.log(`🚀 ComplianceBot Scheduler started`);
@@ -251,6 +379,9 @@ async function runScheduler(): Promise<void> {
   app.listen(port, () => {
     console.log(`🌐 Health check server running on port ${port}`);
   });
+  
+  // Schedule weekly learning reports
+  scheduleWeeklyReports();
   
   while (true) {
     try {
